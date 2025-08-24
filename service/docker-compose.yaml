@@ -1,0 +1,55 @@
+services:
+  upload-client:
+    build: ./upload-client
+    container_name: upload-client
+    ports:
+      - "8080:5000"
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=development
+      - UPLOAD_SERVICE_URL=upload-service:5000
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - upload-service
+    develop:
+      watch:
+        - action: sync
+          path: ./upload-client
+          target: /app
+          ignore:
+            - .git/
+
+  upload-service:
+    build: ./upload-service
+    container_name: upload-service
+    ports:
+      - "8081:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - raw-files:/upload:rw
+      - ./upload-service/proto:/app/proto:ro
+
+  # webserver:
+  #   image: nginx:latest
+  #   ports:
+  #     - "8082:80"
+  #   restart: unless-stopped
+  # mydb:
+  #   image: postgress:latest
+  #   volumes:
+  #     - "db_data:/var/lib/postgresql/data:ro"
+
+volumes:
+  raw-files:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/upload'
+  scaled-files:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/scaled'

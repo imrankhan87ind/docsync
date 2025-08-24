@@ -1,0 +1,57 @@
+
+syntax = "proto3";
+
+package upload;
+
+// UploadService defines a service for uploading files.
+// The upload process is designed to be resilient and efficient, checking for
+// duplicates before the upload starts.
+service UploadService {
+    // UploadFile handles a file upload via a client-side stream.
+    // The client must send a FileInfo message as the first message in the stream.
+    // The server will check if a file with the same sha256 hash already exists.
+    //
+    // - If the file already exists, the RPC will be terminated with an `ALREADY_EXISTS`
+    //   status code.
+    // - If the file is new, the server will accept the subsequent stream of byte
+    //   chunks.
+    //
+    // After all chunks are sent, the client should half-close the stream. The server
+    // will then verify the integrity of the received file against the provided sha256
+    // hash.
+    //
+    // - On successful verification, an `UploadFileResponse` is returned with an `OK`
+    //   status.
+    // - If verification fails, the RPC is terminated with a `DATA_LOSS` status code.
+    rpc UploadFile (stream UploadFileRequest) returns (UploadFileResponse) {}
+}
+
+// FileInfo contains metadata about the file being uploaded.
+message FileInfo {
+    // The name of the file being uploaded.
+    string filename = 1;
+    // The SHA-256 hash of the file content, represented as a hex string.
+    // This is used by the server to check for duplicates and verify data integrity.
+    string sha256 = 2;
+}
+
+// UploadFileRequest is a message in the client stream for a file upload.
+// It can either be file metadata (the first message) or a chunk of file data.
+message UploadFileRequest {
+    oneof request {
+        // File metadata. Must be the first message sent.
+        FileInfo info = 1;
+        // A chunk of the file's binary data.
+        bytes chunk_data = 2;
+    }
+}
+
+// UploadFileResponse is sent back by the server on a successful upload.
+message UploadFileResponse {
+    // A success message.
+    string message = 1;
+    // A unique identifier for the uploaded file, assigned by the server.
+    string file_id = 2;
+    // The total size of the uploaded file in bytes.
+    uint64 size = 3;
+}
