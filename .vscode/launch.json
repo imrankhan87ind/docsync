@@ -28,6 +28,25 @@
             },
             "console": "integratedTerminal",
             "justMyCode": false
+        },
+        {
+            "name": "Python Debugger: Flask 5000",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "flask",
+            "cwd": "${fileDirname}",
+            "env": {
+                "FLASK_APP": "app.py",
+                "FLASK_DEBUG": "1"
+            },
+            "args": [
+                "run",
+                "--no-debugger",
+                "--no-reload"
+            ],
+            "jinja": true,
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
 }

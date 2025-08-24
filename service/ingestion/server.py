@@ -5,6 +5,7 @@ import os
 import hashlib
 import tempfile
 import shutil
+from typing import Iterator
 
 # Import the generated classes
 import upload_pb2
@@ -18,17 +19,17 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
     """
     Implements the gRPC UploadService.
     """
-    def UploadFile(self, request_iterator, context):
+    def UploadFile(self, request_iterator: Iterator[upload_pb2.UploadFileRequest], context: grpc.ServicerContext) -> upload_pb2.UploadFileResponse:
         temp_file_path = None
         try:
             # 1. Receive file metadata from the first message in the stream.
-            first_request = next(request_iterator)
+            first_request: upload_pb2.UploadFileRequest = next(request_iterator)
             if not first_request.HasField("info"):
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 context.set_details("First message must be FileInfo.")
                 return upload_pb2.UploadFileResponse()
 
-            file_info = first_request.info
+            file_info: upload_pb2.FileInfo = first_request.info
             expected_hash_hex = file_info.sha256
             print(f"Received upload request for: {file_info.filename} ({expected_hash_hex})")
 
@@ -97,7 +98,8 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     upload_pb2_grpc.add_UploadServiceServicer_to_server(UploadServiceServicer(), server)
-    port = "5000"
+    # The port is configurable via the GRPC_PORT environment variable.
+    port = os.environ.get("GRPC_PORT", "5001")
     server.add_insecure_port(f'[::]:{port}')
     if not os.path.exists(UPLOAD_DIR):
         os.makedirs(UPLOAD_DIR)
