@@ -49,9 +49,15 @@ services:
       - MONGO_USER=mongoadmin
       - MONGO_PASSWORD=secret
       - MONGO_DBNAME=docsync
+      # RabbitMQ configuration for publishing events.
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=rabbitadmin
+      - RABBITMQ_PASSWORD=rabbitsecret
     depends_on:
       - minio
       - mongo
+      - rabbitmq
     develop:
       watch:
         - action: sync
@@ -132,6 +138,25 @@ services:
     depends_on:
       - mongo
 
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      # AMQP protocol port for services
+      - "5672:5672"
+      # HTTP management UI on http://localhost:15672
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=rabbitadmin
+      - RABBITMQ_DEFAULT_PASS=rabbitsecret
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq/
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # webserver:
   #   image: nginx:latest
   #   ports:
@@ -155,15 +180,15 @@ volumes:
       type: 'none'
       o: 'bind'
       device: './data/scaled'
-  redis-data:
-    driver: local
-    driver_opts:
-      type: 'none'
-      o: 'bind'
-      device: './data/scaled'
   mongo-data:
     driver: local
     driver_opts:
       type: 'none'
       o: 'bind'
       device: './data/mongo'
+  rabbitmq-data:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/rabbitmq'

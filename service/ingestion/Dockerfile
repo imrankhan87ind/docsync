@@ -42,8 +42,7 @@ COPY --from=builder /app/upload_pb2_grpc.py .
 
 # Copy the shared library directly into the app directory.
 # This allows it to be imported as a top-level module inside the container.
-COPY shared/miniocdn ./shared/miniocdn
-COPY shared/mongo ./shared/mongo
+COPY shared ./shared
 
 # Copy the server application code
 COPY service/ingestion/server.py .

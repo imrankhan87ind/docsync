@@ -6,6 +6,7 @@ import hashlib
 from typing import Iterator
 from shared.miniocdn.client import MinioClient, BucketType
 from shared.mongo.client import MongoDbClient
+from shared.grpc_util.stream_wrapper import GrpcStreamWrapper
 
 # Get the execution environment ('docker' or 'local'). Defaults to 'local'.
 EXECUTION_ENVIRONMENT = os.environ.get('EXECUTION_ENVIRONMENT', 'local')
@@ -36,62 +37,6 @@ except (KeyError, ValueError) as e:
 
 # This Minio setting is optional and has a default.
 MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").lower() == "true"
-
-class GrpcStreamWrapper:
-    """
-    A file-like object wrapper for a gRPC stream iterator that also
-    calculates a hash and total bytes on the fly.
-    """
-    def __init__(self, request_iterator: Iterator[upload_pb2.UploadFileRequest], hasher, context: grpc.ServicerContext):
-        self._iterator = request_iterator
-        self._hasher = hasher
-        self._context = context
-        self._buffer = b''
-        self._total_bytes = 0
-
-    def read(self, size: int = -1) -> bytes:
-        """
-        Reads data from the gRPC stream to satisfy the read request.
-        This is called by the Minio client.
-        """
-        # If size is -1, we need to read everything. We can achieve this by
-        # continuously filling the buffer until the stream is exhausted.
-        # The subsequent logic will then return the entire buffer.
-        is_read_all = size == -1
-
-        # Keep reading from the gRPC stream until we have enough data in the buffer
-        # to satisfy the read request, or until the stream is exhausted.
-        while is_read_all or len(self._buffer) < size:
-            try:
-                request = next(self._iterator)
-                if not request.HasField("chunk_data"):
-                    self._context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                    self._context.set_details("Expected chunk_data after the initial FileInfo message.")
-                    raise IOError("Invalid gRPC message in stream")
-
-                chunk = request.chunk_data
-                self._hasher.update(chunk)
-                self._buffer += chunk
-                self._total_bytes += len(chunk)
-
-            except StopIteration:
-                # The client has finished sending data. No more chunks to read.
-                break
-
-        # If we need to read all, size becomes the length of the buffer.
-        if is_read_all:
-            size = len(self._buffer)
-
-        # Slice the buffer to get the data to return
-        data_to_return = self._buffer[:size]
-        # Update the buffer to contain the remaining data
-        self._buffer = self._buffer[size:]
-
-        return data_to_return
-
-    @property
-    def total_bytes_received(self) -> int:
-        return self._total_bytes
 
 class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
     """
@@ -170,7 +115,12 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
 
             # 4. Prepare for streaming upload by creating the hasher and stream wrapper.
             actual_hasher = hashlib.sha256()
-            stream_wrapper = GrpcStreamWrapper(request_iterator, actual_hasher, context)
+            stream_wrapper = GrpcStreamWrapper(
+                request_iterator=request_iterator,
+                hasher=actual_hasher,
+                context=context,
+                chunk_extractor=lambda req: req.chunk_data if req.HasField("chunk_data") else None
+            )
 
             # 5. Stream the file directly to Minio.
             # The wrapper will be read by the Minio client, which also populates the hash on the fly.
