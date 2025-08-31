@@ -1,0 +1,169 @@
+services:
+  ingestion-client:
+    build: 
+      context: ./
+      dockerfile: ./service/ingestion-client/Dockerfile
+    container_name: ingestion-client
+    ports:
+      - "8080:5000"
+    environment:
+      - PORT=5000
+      - FLASK_APP=app.py
+      - FLASK_ENV=development
+      - UPLOAD_SERVICE_URL=ingestion:5000
+      - PYTHONUNBUFFERED=1
+      - EXECUTION_ENVIRONMENT=docker
+    depends_on:
+      - ingestion
+    develop:
+      watch:
+        - action: sync
+          path: ./service/ingestion-client
+          target: /app
+          ignore:
+            - .git/
+
+  ingestion:
+    build:
+      context: ./
+      dockerfile: ./service/ingestion/Dockerfile
+    # The gRPC server inside the container will run on port 5000.
+    container_name: ingestion
+    ports:
+      - "8081:5000"
+    environment:
+      # This port must match the port in UPLOAD_SERVICE_URL for the client
+      # and the internal port in the 'ports' mapping above.
+      - GRPC_PORT=5000
+      - PYTHONUNBUFFERED=1
+      - EXECUTION_ENVIRONMENT=docker
+      # MinIO configuration for the ingestion service.
+      # The server.py will need to be updated to use these variables to connect to MinIO.
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=raw-files
+      # MongoDB configuration for metadata storage.
+      - MONGO_HOST=mongo
+      - MONGO_PORT=27017
+      - MONGO_USER=mongoadmin
+      - MONGO_PASSWORD=secret
+      - MONGO_DBNAME=docsync
+    depends_on:
+      - minio
+      - mongo
+    develop:
+      watch:
+        - action: sync
+          path: ./service/ingestion
+          target: /app
+          ignore:
+            - .git/
+
+  miniocreatebucket:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    restart: on-failure
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set dockerminio http://minio:9000 minioadmin minioadmin;
+      mc mb dockerminio/uploads;
+      mc mb dockerminio/processed/videos;
+      mc mb dockerminio/processed/photos;
+      mc rb --force dockerminio/photo;
+      mc rb --force dockerminio/video;
+      mc rb --force dockerminio/allfiles;
+      exit 0;
+      "
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      # API port for SDKs and clients
+      - "9000:9000"
+      # Web UI console port
+      - "9001:9001"
+    environment:
+      # IMPORTANT: Use secure credentials in production
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=mongoadmin
+      - MONGO_INITDB_ROOT_PASSWORD=secret
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mongo-express
+    restart: unless-stopped
+    ports:
+      # Web UI for MongoDB will be available on http://localhost:8082
+      - "8082:8081"
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=mongo
+      - ME_CONFIG_MONGODB_PORT=27017
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=mongoadmin
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=secret
+      - ME_CONFIG_BASICAUTH_USERNAME=mexpressadmin
+      - ME_CONFIG_BASICAUTH_PASSWORD=mexpresssecret
+    depends_on:
+      - mongo
+
+  # webserver:
+  #   image: nginx:latest
+  #   ports:
+  #     - "8082:80"
+  #   restart: unless-stopped
+  # mydb:
+  #   image: postgress:latest
+  #   volumes:
+  #     - "db_data:/var/lib/postgresql/data:ro"
+
+volumes:
+  minio-data:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/minio'
+  scaled-files:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/scaled'
+  redis-data:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/scaled'
+  mongo-data:
+    driver: local
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/mongo'

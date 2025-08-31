@@ -4,6 +4,9 @@ import grpc
 from flask import Flask
 from typing import Iterator
 
+# Get the execution environment ('docker' or 'local'). Defaults to 'local'.
+EXECUTION_ENVIRONMENT = os.environ.get('EXECUTION_ENVIRONMENT', 'local')
+
 # Import the generated classes
 import upload_pb2, upload_pb2_grpc
 
@@ -12,6 +15,7 @@ app = Flask(__name__)
 FILE_TO_UPLOAD="test-data.mp4"
 CHUNK_SIZE = 8192
 UPLOAD_URL=os.environ.get("UPLOAD_SERVICE_URL", "localhost:5001")
+APP_PORT = int(os.environ.get("PORT", 8000))
 
 @app.route('/uploadtest')
 def uploadtest() -> str:
@@ -73,4 +77,4 @@ def upload_file(filepath: str) -> str:
         return "Failed"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=APP_PORT)

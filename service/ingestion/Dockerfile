@@ -8,7 +8,8 @@ RUN pip install grpcio-tools
 WORKDIR /app
 
 # Copy the proto files from the top-level proto directory into a local proto folder
-COPY ../../proto/ ./proto/
+# The path is relative to the build context (the project root)
+COPY proto/ ./proto/
 
 # Generate Python gRPC code into the current directory
 RUN python -m grpc_tools.protoc \
@@ -32,15 +33,20 @@ RUN mkdir /upload && chown appuser:appuser /upload
 USER appuser
 
 # Install runtime dependencies for the user
-COPY requirements.txt .
+COPY service/ingestion/requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Copy generated gRPC code from the builder stage
 COPY --from=builder /app/upload_pb2.py .
 COPY --from=builder /app/upload_pb2_grpc.py .
 
+# Copy the shared library directly into the app directory.
+# This allows it to be imported as a top-level module inside the container.
+COPY shared/miniocdn ./shared/miniocdn
+COPY shared/mongo ./shared/mongo
+
 # Copy the server application code
-COPY server.py .
+COPY service/ingestion/server.py .
 
 # Expose the gRPC port
 EXPOSE 5000
