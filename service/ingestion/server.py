@@ -6,7 +6,7 @@ from typing import Iterator, Optional
 from shared.miniocdn.client import MinioClient, BucketType
 from bson.objectid import ObjectId
 from shared.mongo.client import MongoDbClient, FileStatus
-from shared.rabbitmq.client import RabbitMQClient, QueueType
+from shared.rabbitmq.client import RabbitMQClient, UploadMessage
 from shared.grpc_util.stream_wrapper import GrpcStreamWrapper
 from shared.environment.config import app_config
 
@@ -178,9 +178,8 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
 
                 # Publish event to RabbitMQ for downstream processing.
                 try:
-                    self.rabbitmq_client.publish_upload_message(
-                        file_id=file_id, sha256=object_name
-                    )
+                    upload_message = UploadMessage(file_id=file_id, sha256=object_name)
+                    self.rabbitmq_client.publish_upload_message(upload_message)
                     logging.info(f"Successfully published upload event for file ID: {file_id}")
 
                     # Update the status to signify the upload and publish steps are complete.

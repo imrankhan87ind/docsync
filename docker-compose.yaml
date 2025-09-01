@@ -42,7 +42,6 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
-      - MINIO_BUCKET=raw-files
       # MongoDB configuration for metadata storage.
       - MONGO_HOST=mongo
       - MONGO_PORT=27017
@@ -55,13 +54,65 @@ services:
       - RABBITMQ_USER=rabbitadmin
       - RABBITMQ_PASSWORD=rabbitsecret
     depends_on:
-      - minio
-      - mongo
-      - rabbitmq
+      minio:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      upload-processor:
+        condition: service_healthy
     develop:
       watch:
         - action: sync
           path: ./service/ingestion
+          target: /app
+          ignore:
+            - .git/
+
+  upload-processor:
+    build:
+      context: ./
+      dockerfile: ./processor/upload/Dockerfile
+    container_name: upload-processor
+    environment:
+      - PYTHONUNBUFFERED=1
+      - EXECUTION_ENVIRONMENT=docker
+      # MinIO configuration
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_RAW_BUCKET=uploads
+      - MINIO_PROCESSED_VIDEO_BUCKET=processed/videos
+      - MINIO_PROCESSED_PHOTO_BUCKET=processed/photos
+      # MongoDB configuration
+      - MONGO_HOST=mongo
+      - MONGO_PORT=27017
+      - MONGO_USER=mongoadmin
+      - MONGO_PASSWORD=secret
+      - MONGO_DBNAME=docsync
+      # RabbitMQ configuration
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=rabbitadmin
+      - RABBITMQ_PASSWORD=rabbitsecret
+    depends_on:
+      - minio
+      - mongo
+      - rabbitmq
+    healthcheck:
+      # This check verifies that the service can connect to RabbitMQ,
+      # indicating it's ready to consume messages.
+      # NOTE: Credentials are hardcoded to match the RabbitMQ service.
+      test: ["CMD-SHELL", "python -c \"import pika; pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', credentials=pika.PlainCredentials('rabbitadmin', 'rabbitsecret')))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s # Gives the container time to start up before the first health check.
+    develop:
+      watch:
+        - action: sync
+          path: ./service/processor/upload
           target: /app
           ignore:
             - .git/
