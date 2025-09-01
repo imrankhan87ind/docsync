@@ -2,3 +2,4 @@ grpcio
 protobuf
 minio
 pymongo
+pika

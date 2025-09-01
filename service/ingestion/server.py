@@ -1,42 +1,16 @@
 import grpc
 from concurrent import futures
-import time
-import os
-import hashlib 
+import hashlib
+import logging
 from typing import Iterator
 from shared.miniocdn.client import MinioClient, BucketType
 from shared.mongo.client import MongoDbClient
+from shared.rabbitmq.client import RabbitMQClient, QueueType
 from shared.grpc_util.stream_wrapper import GrpcStreamWrapper
-
-# Get the execution environment ('docker' or 'local'). Defaults to 'local'.
-EXECUTION_ENVIRONMENT = os.environ.get('EXECUTION_ENVIRONMENT', 'local')
+from shared.environment.config import app_config
 
 # Import the generated classes
 import upload_pb2, upload_pb2_grpc
-
-
-
-# Minio configuration from environment variables.
-# The following are required and will cause the service to fail at startup if not set.
-try:
-    MINIO_ENDPOINT = os.environ["MINIO_ENDPOINT"]
-    MINIO_ACCESS_KEY = os.environ["MINIO_ACCESS_KEY"]
-    MINIO_SECRET_KEY = os.environ["MINIO_SECRET_KEY"]
-except KeyError as e:
-    raise RuntimeError(f"FATAL: Missing required environment variable: {e}. Please set it before running.") from e
-
-# MongoDB configuration from environment variables.
-try:
-    MONGO_HOST = os.environ["MONGO_HOST"]
-    MONGO_PORT = int(os.environ["MONGO_PORT"])
-    MONGO_USER = os.environ["MONGO_USER"]
-    MONGO_PASSWORD = os.environ["MONGO_PASSWORD"]
-    MONGO_DBNAME = os.environ["MONGO_DBNAME"]
-except (KeyError, ValueError) as e:
-    raise RuntimeError(f"FATAL: Missing or invalid MongoDB environment variable: {e}.") from e
-
-# This Minio setting is optional and has a default.
-MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").lower() == "true"
 
 class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
     """
@@ -48,31 +22,45 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
         """
         try:
             self.minio_client = MinioClient(
-                endpoint=MINIO_ENDPOINT,
-                access_key=MINIO_ACCESS_KEY,
-                secret_key=MINIO_SECRET_KEY,
-                secure=MINIO_SECURE
+                endpoint=app_config.minio.endpoint,
+                access_key=app_config.minio.access_key,
+                secret_key=app_config.minio.secret_key,
+                secure=app_config.minio.secure
             )
-            print("Minio client initialized.")
+            logging.info("Minio client initialized.")
         except ValueError as e:
-            print(f"FATAL: Could not initialize Minio client: {e}")
+            logging.critical(f"Could not initialize Minio client: {e}")
             raise
-        
+
         try:
             self.mongo_client = MongoDbClient(
-                host=MONGO_HOST,
-                port=MONGO_PORT,
-                user=MONGO_USER,
-                password=MONGO_PASSWORD,
-                dbname=MONGO_DBNAME
+                host=app_config.mongo.host,
+                port=app_config.mongo.port,
+                user=app_config.mongo.user,
+                password=app_config.mongo.password,
+                dbname=app_config.mongo.dbname
             )
-            print("MongoDB client initialized.")
+            logging.info("MongoDB client initialized.")
         except Exception as e:
-            print(f"FATAL: Could not initialize MongoDB client: {e}")
+            logging.critical(f"Could not initialize MongoDB client: {e}")
+            raise
+
+        try:
+            self.rabbitmq_client = RabbitMQClient(
+                host=app_config.rabbitmq.host,
+                port=app_config.rabbitmq.port,
+                user=app_config.rabbitmq.user,
+                password=app_config.rabbitmq.password
+            )
+            # Declare the queue we'll be publishing to. This is idempotent.
+            self.rabbitmq_client.declare_upload_queue()
+            logging.info("RabbitMQ client initialized.")
+        except Exception as e:
+            logging.critical(f"Could not initialize RabbitMQ client: {e}")
             raise
 
     def UploadFile(self, request_iterator: Iterator[upload_pb2.UploadFileRequest], context: grpc.ServicerContext) -> upload_pb2.UploadFileResponse:
-        try: 
+        try:
             # 1. Receive file metadata from the first message in the stream.
             first_request: upload_pb2.UploadFileRequest = next(request_iterator)
             if not first_request.HasField("info"):
@@ -82,7 +70,7 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
 
             file_info: upload_pb2.FileInfo = first_request.info
             expected_hash_hex = file_info.sha256
-            print(f"Received upload request for: {file_info.filename} ({expected_hash_hex})")
+            logging.info(f"Received upload request for: {file_info.filename} ({expected_hash_hex})")
 
             # 2. Validate metadata.
             if not expected_hash_hex:
@@ -97,7 +85,7 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
                 # Metadata exists. Let's verify if the file also exists in storage.
                 if self.minio_client.file_exists(BucketType.RAW, object_name):
                     # Consistent state: file exists in both DB and storage.
-                    print(f"Duplicate file detected in MongoDB and Minio: {object_name}. Rejecting upload.")
+                    logging.info(f"Duplicate file detected in MongoDB and Minio: {object_name}. Rejecting upload.")
                     context.set_code(grpc.StatusCode.ALREADY_EXISTS)
                     context.set_details(f"File with hash {object_name} already exists.")
                     return upload_pb2.UploadFileResponse(
@@ -108,10 +96,10 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
                 else:
                     # Inconsistent state: metadata exists but file is missing from storage.
                     # This is an orphaned record. We should clean it up and proceed with the upload.
-                    print(f"Inconsistency found: Metadata for {object_name} exists in DB, but file is missing from Minio.")
-                    print(f"Deleting orphaned metadata record with ID: {existing_file['_id']}")
+                    logging.warning(f"Inconsistency found: Metadata for {object_name} exists in DB, but file is missing from Minio.")
+                    logging.info(f"Deleting orphaned metadata record with ID: {existing_file['_id']}")
                     self.mongo_client.raw_files.delete_one({"_id": existing_file['_id']})
-                    print(f"Orphaned record for {object_name} deleted. Proceeding with new upload.")
+                    logging.info(f"Orphaned record for {object_name} deleted. Proceeding with new upload.")
 
             # 4. Prepare for streaming upload by creating the hasher and stream wrapper.
             actual_hasher = hashlib.sha256()
@@ -124,7 +112,7 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
 
             # 5. Stream the file directly to Minio.
             # The wrapper will be read by the Minio client, which also populates the hash on the fly.
-            print(f"Streaming to Minio: bucket='{BucketType.RAW.value}', object='{object_name}'")
+            logging.info(f"Streaming to Minio: bucket='{BucketType.RAW.value}', object='{object_name}'")
             self.minio_client.upload_stream(
                 bucket_name=BucketType.RAW,
                 object_name=object_name,
@@ -134,8 +122,8 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
             # 6. Verify the integrity of the fully uploaded file.
             actual_hash_hex = actual_hasher.hexdigest()
             if actual_hash_hex != expected_hash_hex:
-                print(f"Hash mismatch for {file_info.filename}. Expected {expected_hash_hex}, got {actual_hash_hex}.")
-                print(f"Deleting invalid object from Minio: {object_name}")
+                logging.warning(f"Hash mismatch for {file_info.filename}. Expected {expected_hash_hex}, got {actual_hash_hex}.")
+                logging.info(f"Deleting invalid object from Minio: {object_name}")
                 # IMPORTANT: Clean up the invalid file that was just uploaded.
                 self.minio_client.delete_file(BucketType.RAW, object_name)
 
@@ -152,18 +140,28 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
                     size=total_bytes_received,
                     object_name=object_name
                 )
-                print(f"Successfully saved metadata to MongoDB for file ID: {file_id}")
+                logging.info(f"Successfully saved metadata to MongoDB for file ID: {file_id}")
+
+                # Publish event to RabbitMQ for downstream processing.
+                try:
+                    self.rabbitmq_client.publish_upload_message(
+                        file_id=file_id, sha256=object_name
+                    )
+                    logging.info(f"Successfully published upload event for file ID: {file_id}")
+                except Exception as mq_e:
+                    # If the message queue fails, log a warning but do not fail the upload.
+                    logging.warning(f"Failed to publish RabbitMQ message for file ID {file_id}: {mq_e}")
             except Exception as e:
                 # CRITICAL: Failed to save metadata. Rollback the Minio upload.
-                print(f"CRITICAL: Failed to save metadata for {object_name} after upload: {e}")
-                print(f"Attempting to roll back by deleting object from Minio: {object_name}")
+                logging.critical(f"Failed to save metadata for {object_name} after upload: {e}")
+                logging.info(f"Attempting to roll back by deleting object from Minio: {object_name}")
                 self.minio_client.delete_file(BucketType.RAW, object_name)
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details("Failed to save file metadata after upload. The operation was rolled back.")
                 return upload_pb2.UploadFileResponse()
 
             # 8. Send a success response.
-            print(f"File '{file_info.filename}' streamed successfully to Minio as '{object_name}'. Size: {total_bytes_received} bytes.")
+            logging.info(f"File '{file_info.filename}' streamed successfully to Minio as '{object_name}'. Size: {total_bytes_received} bytes.")
             return upload_pb2.UploadFileResponse(
                 message=f"File '{file_info.filename}' uploaded successfully.",
                 file_id=file_id, # The MongoDB document ID
@@ -171,18 +169,21 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
             )
 
         except Exception as e:
-            print(f"An unexpected error occurred during streaming upload: {e}")
+            logging.error(f"An unexpected error occurred during streaming upload: {e}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details("An internal server error occurred during streaming.")
             return upload_pb2.UploadFileResponse()
 
 def serve():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    app_config.assert_all()
+    logging.info("All required configurations are loaded and validated.")
+
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     upload_pb2_grpc.add_UploadServiceServicer_to_server(UploadServiceServicer(), server)
-    # The port is configurable via the GRPC_PORT environment variable.
-    port = os.environ.get("GRPC_PORT", "5001")
-    server.add_insecure_port(f'[::]:{port}')
-    print(f"Server starting on port {port}, uploads will be sent to Minio...")
+    # The port is configured via the shared app_config.
+    server.add_insecure_port(f'[::]:{app_config.grpc_port}')
+    logging.info(f"Server starting on port {app_config.grpc_port}, uploads will be sent to Minio...")
     server.start()
     server.wait_for_termination()
 
