@@ -115,14 +115,14 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
             if existing_file:
                 # If the file exists in storage AND its status is not UNKNOWN, it's a true duplicate.
                 # A file with status UNKNOWN is considered an incomplete upload that can be retried.
-                if self.minio_client.file_exists(BucketType.RAW, object_name) and existing_file['status'] != FileStatus.UNKNOWN.value:
-                    logging.info(f"Duplicate file detected with status '{existing_file['status']}': {object_name}. Rejecting upload.")
+                if self.minio_client.file_exists(BucketType.RAW, object_name) and existing_file.status != FileStatus.UNKNOWN:
+                    logging.info(f"Duplicate file detected with status '{existing_file.status.value}': {object_name}. Rejecting upload.")
                     context.set_code(grpc.StatusCode.ALREADY_EXISTS)
                     context.set_details(f"File with hash {object_name} already exists.")
                     return upload_pb2.UploadFileResponse(
                         message="File already exists.",
-                        file_id=str(existing_file['_id']),
-                        size=existing_file.get('size', 0)
+                        file_id=str(existing_file._id),
+                        size=existing_file.size
                     )
                 else:
                     # Inconsistent state found:
@@ -131,10 +131,10 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
                     # In either case, we treat the old record as invalid and start over.
                     logging.warning(
                         f"Inconsistency or incomplete state found for {object_name} with status "
-                        f"'{existing_file.get('status', 'N/A')}'. Rolling back to retry."
+                        f"'{existing_file.status.value}'. Rolling back to retry."
                     )
                     # Use the rollback method to clean up both Minio and MongoDB before proceeding.
-                    self._rollback_upload(object_name=object_name, file_id=str(existing_file['_id']))
+                    self._rollback_upload(object_name=object_name, file_id=str(existing_file._id))
                     logging.info(f"Rollback of inconsistent state for {object_name} complete. Proceeding with new upload.")
 
             # 4. Prepare for streaming upload by creating the hasher and stream wrapper.

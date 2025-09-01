@@ -1,8 +1,10 @@
 import os
+import logging
 from enum import Enum
 from typing import Union
 from minio import Minio
 from minio.error import S3Error
+import urllib3
 
 class BucketType(Enum):
     """
@@ -52,8 +54,9 @@ class MinioClient:
                 secret_key=secret_key,
                 secure=secure
             )
+            logging.info("MinioCDN client initialized successfully.")
         except Exception as e:
-            print(f"Fatal: Failed to initialize Minio client: {e}")
+            logging.critical(f"Fatal: Failed to initialize Minio client: {e}", exc_info=True)
             raise
 
     def _ensure_bucket_exists(self, bucket_name: str):
@@ -70,9 +73,9 @@ class MinioClient:
         try:
             if not self.client.bucket_exists(bucket_name):
                 self.client.make_bucket(bucket_name)
-                print(f"Successfully created Minio bucket: {bucket_name}")
+                logging.info(f"Successfully created Minio bucket: {bucket_name}")
         except S3Error as e:
-            print(f"Error: Could not check or create bucket '{bucket_name}': {e}")
+            logging.error(f"Error: Could not check or create bucket '{bucket_name}': {e}", exc_info=True)
             raise
 
     def file_exists(self, bucket_name: BucketType, object_name: str) -> bool:
@@ -94,8 +97,7 @@ class MinioClient:
             if exc.code == "NoSuchKey":
                 return False
             # For any other S3 errors, it's better to let the caller handle it.
-            print(
-                f"Error: Failed to check for object '{object_name}' in bucket '{bucket_name_str}': {exc}")
+            logging.error(f"Error checking for object '{object_name}' in bucket '{bucket_name_str}': {exc}", exc_info=True)
             raise
 
     def upload_file(self, bucket_name: BucketType, object_name: str, file_path: str):
@@ -114,8 +116,7 @@ class MinioClient:
         try:
             self.client.fput_object(bucket_name_str, object_name, file_path)
         except S3Error as e:
-            print(
-                f"Error: Failed to upload '{file_path}' to '{bucket_name_str}/{object_name}': {e}")
+            logging.error(f"Error uploading '{file_path}' to '{bucket_name_str}/{object_name}': {e}", exc_info=True)
             raise
 
     def upload_stream(self, bucket_name: BucketType, object_name: str, stream, part_size: int = 10 * 1024 * 1024):
@@ -144,8 +145,33 @@ class MinioClient:
                 part_size=part_size
             )
         except S3Error as e:
-            print(
-                f"Error: Failed to upload stream to '{bucket_name_str}/{object_name}': {e}")
+            logging.error(f"Error uploading stream to '{bucket_name_str}/{object_name}': {e}", exc_info=True)
+            raise
+
+    def get_file_stream(self, bucket_name: BucketType, object_name: str) -> urllib3.response.BaseHTTPResponse:
+        """
+        Retrieves an object from a specified bucket as a stream.
+
+        The caller is responsible for managing the stream, including closing it
+        to release the connection (e.g., by using a `with` statement on the
+        response or calling `response.close()`).
+
+        Args:
+            bucket_name (BucketType): The `BucketType` enum member for the bucket.
+            object_name (str): The name of the object to retrieve.
+
+        Returns:
+            urllib3.response.BaseHTTPResponse: A stream-like object with the file's content.
+
+        Raises:
+            S3Error: If the object does not exist or another API error occurs.
+        """
+        bucket_name_str = bucket_name.value
+        try:
+            response = self.client.get_object(bucket_name_str, object_name)
+            return response
+        except S3Error as e:
+            logging.error(f"Error getting object '{object_name}' from bucket '{bucket_name_str}': {e}", exc_info=True)
             raise
 
     def delete_file(self, bucket_name: BucketType, object_name: str):
@@ -160,6 +186,5 @@ class MinioClient:
         try:
             self.client.remove_object(bucket_name_str, object_name)
         except S3Error as e:
-            print(
-                f"Error: Failed to delete object '{object_name}' from bucket '{bucket_name_str}': {e}")
+            logging.error(f"Error deleting object '{object_name}' from bucket '{bucket_name_str}': {e}", exc_info=True)
             raise

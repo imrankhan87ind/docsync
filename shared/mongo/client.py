@@ -1,14 +1,17 @@
-import os
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Optional, Dict, Any
+from __future__ import annotations
 
-from bson.objectid import ObjectId
+import os
+import logging
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from bson import ObjectId
+
 from pymongo import MongoClient as PymongoClient, IndexModel, ASCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import ConnectionFailure
-
 
 class FileStatus(Enum):
     """
@@ -20,6 +23,82 @@ class FileStatus(Enum):
     PROCESSING = "PROCESSING"    # A worker has picked up the message and is processing the file
     COMPLETED = "COMPLETED"      # Processing finished successfully
     FAILED = "FAILED"            # Processing failed
+
+
+@dataclass
+class RawFileDetails:
+    """
+    Represents the 'file_details' sub-document in the 'raw_files' collection.
+    This holds metadata extracted from the file during processing.
+    """
+    mime_type: Optional[str] = None
+    # Future fields like 'width', 'height', 'duration' can be added here.
+
+    @classmethod
+    def from_mongo(cls, data: Optional[Dict[str, Any]]) -> RawFileDetails:
+        """
+        Creates a RawFileDetails instance from a MongoDB sub-document (dictionary).
+        Returns an empty RawFileDetails instance if data is None or empty.
+        """
+        if not data:
+            return cls()
+        return cls(**data)
+
+    def to_mongo(self) -> Dict[str, Any]:
+        """
+        Converts the dataclass instance to a dictionary.
+        """
+        return asdict(self)
+
+
+@dataclass
+class RawFileMetadata:
+    """
+    Represents a document in the 'raw_files' collection in MongoDB, providing
+    a structured way to handle raw file metadata.
+    """
+    sha256: str
+    filename: str
+    size: int
+    object_name: str
+    status: FileStatus
+    uploaded_at: datetime
+    file_details: RawFileDetails = field(default_factory=RawFileDetails)
+    updated_at: Optional[datetime] = None
+    _id: Optional[ObjectId] = field(default=None, repr=False)
+
+    @classmethod
+    def from_mongo(cls, data: Optional[Dict[str, Any]]) -> Optional[RawFileMetadata]:
+        """
+        Creates a RawFileMetadata instance from a MongoDB document (dictionary).
+        Returns None if data is None or a required key is missing.
+        """
+        if not data:
+            return None
+        try:
+            data_copy = data.copy()
+            data_copy["file_details"] = RawFileDetails.from_mongo(data_copy.get("file_details"))
+            data_copy["status"] = FileStatus(data_copy.get("status", "UNKNOWN"))
+            return cls(**data_copy)
+        except (KeyError, TypeError) as e:
+            logging.error(f"Failed to create RawFileMetadata from mongo data: {e}. Data: {data}")
+            return None
+
+    def to_mongo(self) -> Dict[str, Any]:
+        """
+        Converts the dataclass instance to a dictionary suitable for MongoDB.
+        """
+        data = asdict(self)
+        data['file_details'] = self.file_details.to_mongo()
+        # Convert Enum to its value
+        data['status'] = self.status.value
+        # Remove fields that are None and shouldn't be stored if not set
+        if self._id is None:
+            del data['_id']
+        if self.updated_at is None:
+            del data['updated_at']
+        return data
+
 
 
 class MongoDbClient:
@@ -60,7 +139,7 @@ class MongoDbClient:
             )
             # The ismaster command is cheap and does not require auth.
             self.client.admin.command('ismaster')
-            print("Successfully connected to MongoDB.")
+            logging.info("Successfully connected to MongoDB.")
 
             self.db: Database = self.client[dbname]
             self._raw_files: Collection = self.db.raw_files
@@ -69,10 +148,10 @@ class MongoDbClient:
             self._ensure_indexes()
 
         except ConnectionFailure as e:
-            print(f"Fatal: Could not connect to MongoDB: {e}")
+            logging.critical(f"Fatal: Could not connect to MongoDB: {e}", exc_info=True)
             raise
         except Exception as e:
-            print(f"Fatal: An error occurred during MongoDB initialization: {e}")
+            logging.critical(f"Fatal: An error occurred during MongoDB initialization: {e}", exc_info=True)
             raise
 
     def _ensure_indexes(self):
@@ -85,14 +164,14 @@ class MongoDbClient:
             [("sha256", ASCENDING)], name="sha256_unique_index", unique=True
         )
         self._raw_files.create_indexes([raw_files_sha256_index])
-        print("Ensured indexes for 'raw_files' collection.")
+        logging.info("Ensured indexes for 'raw_files' collection.")
 
         # Index for processed_files to quickly find all processed versions of a raw file
         processed_raw_file_id_index = IndexModel(
             [("raw_file_id", ASCENDING)], name="raw_file_id_index"
         )
         self._processed_files.create_indexes([processed_raw_file_id_index])
-        print("Ensured indexes for 'processed_files' collection.")
+        logging.info("Ensured indexes for 'processed_files' collection.")
 
     def save_raw_file_metadata(
         self, sha256: str, filename: str, size: int, object_name: str
@@ -110,6 +189,7 @@ class MongoDbClient:
         - object_name (str): The key of the file in the 'raw' Minio bucket.
         - status (str): Initial status, defaults to 'UNKNOWN'.
         - uploaded_at (datetime): Timestamp of when the file was uploaded.
+        - file_details (dict): A sub-document for details discovered during processing.
 
         Args:
             sha256: The SHA256 hash of the file.
@@ -120,14 +200,15 @@ class MongoDbClient:
         Returns:
             The string representation of the inserted document's ID.
         """
-        document = {
-            "sha256": sha256,
-            "filename": filename,
-            "size": size,
-            "object_name": object_name,
-            "status": FileStatus.UNKNOWN.value,
-            "uploaded_at": datetime.now(timezone.utc),
-        }
+        metadata = RawFileMetadata(
+            sha256=sha256,
+            filename=filename,
+            size=size,
+            object_name=object_name,
+            status=FileStatus.UNKNOWN,
+            uploaded_at=datetime.now(timezone.utc),
+        )
+        document = metadata.to_mongo()
         result = self._raw_files.insert_one(document)
         return str(result.inserted_id)
 
@@ -154,6 +235,57 @@ class MongoDbClient:
         )
         return result.modified_count > 0
 
+    def get_raw_file_by_id(self, file_id: str) -> Optional[RawFileMetadata]:
+        """
+        Retrieves a raw file's metadata document using its ObjectId.
+
+        Args:
+            file_id: The string representation of the document's ObjectId.
+
+        Returns:
+            A RawFileMetadata object if found, otherwise None.
+        """
+        try:
+            document = self._raw_files.find_one({"_id": ObjectId(file_id)})
+            return RawFileMetadata.from_mongo(document)
+        except Exception as e:
+            logging.error(f"Error finding file by id {file_id}: {e}", exc_info=True)
+            return None
+
+    def update_raw_file_details(self, file_id: str, details: RawFileDetails) -> bool:
+        """
+        Updates the details of a raw file document.
+
+        This method updates fields in the nested 'file_details' document and
+        also updates the top-level `updated_at` timestamp. It only updates
+        fields that are not None in the provided `details` object.
+
+        Args:
+            file_id: The string representation of the MongoDB ObjectId.
+            details: A RawFileDetails object with the new details to set.
+
+        Returns:
+            True if the document was modified, False otherwise.
+        """
+        try:
+            details_dict = details.to_mongo()
+            update_fields = {
+                f"file_details.{k}": v for k, v in details_dict.items() if v is not None
+            }
+
+            if not update_fields:
+                return False  # Nothing to update, so 0 modified.
+
+            update_fields["updated_at"] = datetime.now(timezone.utc)
+            result = self._raw_files.update_one(
+                {"_id": ObjectId(file_id)},
+                {"$set": update_fields}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logging.error(f"Error updating file details for file_id {file_id}: {e}", exc_info=True)
+            return False
+
     def delete_raw_file_by_id(self, file_id: str) -> bool:
         """
         Deletes a raw file metadata document using its ObjectId.
@@ -164,10 +296,14 @@ class MongoDbClient:
         Returns:
             True if a document was deleted, False otherwise.
         """
-        result = self._raw_files.delete_one({"_id": ObjectId(file_id)})
-        return result.deleted_count > 0
+        try:
+            result = self._raw_files.delete_one({"_id": ObjectId(file_id)})
+            return result.deleted_count > 0
+        except Exception as e:
+            logging.error(f"Error deleting file by id {file_id}: {e}", exc_info=True)
+            return False
 
-    def get_raw_file_by_sha256(self, sha256: str) -> Optional[Dict[str, Any]]:
+    def get_raw_file_by_sha256(self, sha256: str) -> Optional[RawFileMetadata]:
         """
         Retrieves a raw file's metadata document using its SHA256 hash.
 
@@ -175,9 +311,14 @@ class MongoDbClient:
             sha256: The SHA256 hash of the file to find.
 
         Returns:
-            The document if found, otherwise None.
+            A RawFileMetadata object if found, otherwise None.
         """
-        return self._raw_files.find_one({"sha256": sha256})
+        try:
+            document = self._raw_files.find_one({"sha256": sha256})
+            return RawFileMetadata.from_mongo(document)
+        except Exception as e:
+            logging.error(f"Error finding file by sha256 {sha256}: {e}", exc_info=True)
+            return None
 
     def save_processed_file_metadata(
         self,
