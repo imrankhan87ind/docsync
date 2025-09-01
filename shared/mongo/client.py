@@ -1,5 +1,6 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional, Dict, Any
 
 from bson.objectid import ObjectId
@@ -7,6 +8,18 @@ from pymongo import MongoClient as PymongoClient, IndexModel, ASCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import ConnectionFailure
+
+
+class FileStatus(Enum):
+    """
+    Defines the possible lifecycle states for a file in the system.
+    """
+    UNKNOWN = "UNKNOWN"          # Initial state before any processing
+    UPLOADED = "UPLOADED"        # File successfully uploaded to Minio, metadata saved
+    PUBLISHED = "PUBLISHED"      # Processing message published to RabbitMQ
+    PROCESSING = "PROCESSING"    # A worker has picked up the message and is processing the file
+    COMPLETED = "COMPLETED"      # Processing finished successfully
+    FAILED = "FAILED"            # Processing failed
 
 
 class MongoDbClient:
@@ -50,8 +63,8 @@ class MongoDbClient:
             print("Successfully connected to MongoDB.")
 
             self.db: Database = self.client[dbname]
-            self.raw_files: Collection = self.db.raw_files
-            self.processed_files: Collection = self.db.processed_files
+            self._raw_files: Collection = self.db.raw_files
+            self._processed_files: Collection = self.db.processed_files
 
             self._ensure_indexes()
 
@@ -71,14 +84,14 @@ class MongoDbClient:
         raw_files_sha256_index = IndexModel(
             [("sha256", ASCENDING)], name="sha256_unique_index", unique=True
         )
-        self.raw_files.create_indexes([raw_files_sha256_index])
+        self._raw_files.create_indexes([raw_files_sha256_index])
         print("Ensured indexes for 'raw_files' collection.")
 
         # Index for processed_files to quickly find all processed versions of a raw file
         processed_raw_file_id_index = IndexModel(
             [("raw_file_id", ASCENDING)], name="raw_file_id_index"
         )
-        self.processed_files.create_indexes([processed_raw_file_id_index])
+        self._processed_files.create_indexes([processed_raw_file_id_index])
         print("Ensured indexes for 'processed_files' collection.")
 
     def save_raw_file_metadata(
@@ -87,12 +100,15 @@ class MongoDbClient:
         """
         Saves metadata for a raw, unprocessed file.
 
-        Schema for `raw_files`:
+        The status field is designed to track the file's lifecycle using the
+        FileStatus enum.
+
+        Initial schema for `raw_files`:
         - sha256 (str): Unique hash of the file content.
         - filename (str): Original name of the file.
         - size (int): Size of the file in bytes.
         - object_name (str): The key of the file in the 'raw' Minio bucket.
-        - status (str): 'uploaded', 'processing', 'processed', 'failed'.
+        - status (str): Initial status, defaults to 'UNKNOWN'.
         - created_at (datetime): Timestamp of creation.
 
         Args:
@@ -109,11 +125,47 @@ class MongoDbClient:
             "filename": filename,
             "size": size,
             "object_name": object_name,
-            "status": "uploaded",
-            "created_at": datetime.utcnow(),
+            "status": FileStatus.UNKNOWN.value,
+            "created_at": datetime.now(timezone.utc),
         }
-        result = self.raw_files.insert_one(document)
+        result = self._raw_files.insert_one(document)
         return str(result.inserted_id)
+
+    def update_raw_file_status(self, file_id: str, new_status: FileStatus) -> bool:
+        """
+        Updates the status of a raw file document. Also adds/updates an
+        `updated_at` timestamp.
+
+        Args:
+            file_id: The string representation of the document's ObjectId.
+            new_status: The new status to set, as a FileStatus enum member.
+
+        Returns:
+            True if a document was found and modified, False otherwise.
+        """
+        result = self._raw_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {
+                "$set": {
+                    "status": new_status.value,
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            },
+        )
+        return result.modified_count > 0
+
+    def delete_raw_file_by_id(self, file_id: str) -> bool:
+        """
+        Deletes a raw file metadata document using its ObjectId.
+
+        Args:
+            file_id: The string representation of the document's ObjectId.
+
+        Returns:
+            True if a document was deleted, False otherwise.
+        """
+        result = self._raw_files.delete_one({"_id": ObjectId(file_id)})
+        return result.deleted_count > 0
 
     def get_raw_file_by_sha256(self, sha256: str) -> Optional[Dict[str, Any]]:
         """
@@ -125,7 +177,7 @@ class MongoDbClient:
         Returns:
             The document if found, otherwise None.
         """
-        return self.raw_files.find_one({"sha256": sha256})
+        return self._raw_files.find_one({"sha256": sha256})
 
     def save_processed_file_metadata(
         self,
@@ -166,7 +218,7 @@ class MongoDbClient:
             "size": size,
             "object_name": object_name,
             "bucket_name": bucket_name,
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
         }
-        result = self.processed_files.insert_one(document)
+        result = self._processed_files.insert_one(document)
         return str(result.inserted_id)

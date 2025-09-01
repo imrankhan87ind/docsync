@@ -2,9 +2,10 @@ import grpc
 from concurrent import futures
 import hashlib
 import logging
-from typing import Iterator
+from typing import Iterator, Optional
 from shared.miniocdn.client import MinioClient, BucketType
-from shared.mongo.client import MongoDbClient
+from bson.objectid import ObjectId
+from shared.mongo.client import MongoDbClient, FileStatus
 from shared.rabbitmq.client import RabbitMQClient, QueueType
 from shared.grpc_util.stream_wrapper import GrpcStreamWrapper
 from shared.environment.config import app_config
@@ -59,6 +60,36 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
             logging.critical(f"Could not initialize RabbitMQ client: {e}")
             raise
 
+    def _rollback_upload(self, object_name: str, file_id: Optional[str] = None):
+        """
+        Rolls back a failed upload by deleting artifacts from Minio and MongoDB.
+
+        This method is designed to be safe to call even if some artifacts don't
+        exist. It logs errors but does not re-raise them to ensure all cleanup
+        steps are attempted.
+
+        Args:
+            object_name: The name of the object to delete from Minio.
+            file_id: The optional ID of the metadata record to delete from MongoDB.
+        """
+        logging.warning(f"Initiating rollback for object '{object_name}' and file ID '{file_id}'.")
+
+        # 1. Delete file from Minio storage
+        if object_name:
+            try:
+                logging.info(f"Rollback: Deleting object from Minio: {object_name}")
+                self.minio_client.delete_file(BucketType.RAW, object_name)
+            except Exception as e:
+                logging.error(f"Rollback: Failed to delete object '{object_name}' from Minio: {e}", exc_info=True)
+
+        # 2. Delete metadata from MongoDB
+        if file_id:
+            try:
+                logging.info(f"Rollback: Deleting metadata record: {file_id}")
+                self.mongo_client.delete_raw_file_by_id(file_id)
+            except Exception as e:
+                logging.error(f"Rollback: Failed to delete metadata record '{file_id}' from MongoDB: {e}", exc_info=True)
+
     def UploadFile(self, request_iterator: Iterator[upload_pb2.UploadFileRequest], context: grpc.ServicerContext) -> upload_pb2.UploadFileResponse:
         try:
             # 1. Receive file metadata from the first message in the stream.
@@ -82,24 +113,29 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
             object_name = expected_hash_hex
             existing_file = self.mongo_client.get_raw_file_by_sha256(object_name)
             if existing_file:
-                # Metadata exists. Let's verify if the file also exists in storage.
-                if self.minio_client.file_exists(BucketType.RAW, object_name):
-                    # Consistent state: file exists in both DB and storage.
-                    logging.info(f"Duplicate file detected in MongoDB and Minio: {object_name}. Rejecting upload.")
+                # If the file exists in storage AND its status is not UNKNOWN, it's a true duplicate.
+                # A file with status UNKNOWN is considered an incomplete upload that can be retried.
+                if self.minio_client.file_exists(BucketType.RAW, object_name) and existing_file['status'] != FileStatus.UNKNOWN.value:
+                    logging.info(f"Duplicate file detected with status '{existing_file['status']}': {object_name}. Rejecting upload.")
                     context.set_code(grpc.StatusCode.ALREADY_EXISTS)
                     context.set_details(f"File with hash {object_name} already exists.")
                     return upload_pb2.UploadFileResponse(
                         message="File already exists.",
                         file_id=str(existing_file['_id']),
-                        size=existing_file['size']
+                        size=existing_file.get('size', 0)
                     )
                 else:
-                    # Inconsistent state: metadata exists but file is missing from storage.
-                    # This is an orphaned record. We should clean it up and proceed with the upload.
-                    logging.warning(f"Inconsistency found: Metadata for {object_name} exists in DB, but file is missing from Minio.")
-                    logging.info(f"Deleting orphaned metadata record with ID: {existing_file['_id']}")
-                    self.mongo_client.raw_files.delete_one({"_id": existing_file['_id']})
-                    logging.info(f"Orphaned record for {object_name} deleted. Proceeding with new upload.")
+                    # Inconsistent state found:
+                    # 1. DB record exists but file is missing from storage (orphan).
+                    # 2. File exists in storage but DB status is UNKNOWN (incomplete initial save).
+                    # In either case, we treat the old record as invalid and start over.
+                    logging.warning(
+                        f"Inconsistency or incomplete state found for {object_name} with status "
+                        f"'{existing_file.get('status', 'N/A')}'. Rolling back to retry."
+                    )
+                    # Use the rollback method to clean up both Minio and MongoDB before proceeding.
+                    self._rollback_upload(object_name=object_name, file_id=str(existing_file['_id']))
+                    logging.info(f"Rollback of inconsistent state for {object_name} complete. Proceeding with new upload.")
 
             # 4. Prepare for streaming upload by creating the hasher and stream wrapper.
             actual_hasher = hashlib.sha256()
@@ -123,16 +159,14 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
             actual_hash_hex = actual_hasher.hexdigest()
             if actual_hash_hex != expected_hash_hex:
                 logging.warning(f"Hash mismatch for {file_info.filename}. Expected {expected_hash_hex}, got {actual_hash_hex}.")
-                logging.info(f"Deleting invalid object from Minio: {object_name}")
-                # IMPORTANT: Clean up the invalid file that was just uploaded.
-                self.minio_client.delete_file(BucketType.RAW, object_name)
-
+                self._rollback_upload(object_name=object_name)
                 context.set_code(grpc.StatusCode.DATA_LOSS)
                 context.set_details("Uploaded data hash does not match the provided SHA-256 hash.")
                 return upload_pb2.UploadFileResponse()
 
             # 7. Save metadata to MongoDB.
             total_bytes_received = stream_wrapper.total_bytes_received
+            file_id: Optional[str] = None
             try:
                 file_id = self.mongo_client.save_raw_file_metadata(
                     sha256=actual_hash_hex,
@@ -148,14 +182,25 @@ class UploadServiceServicer(upload_pb2_grpc.UploadServiceServicer):
                         file_id=file_id, sha256=object_name
                     )
                     logging.info(f"Successfully published upload event for file ID: {file_id}")
+
+                    # Update the status to signify the upload and publish steps are complete.
+                    self.mongo_client.update_raw_file_status(file_id, FileStatus.UPLOADED)
+                    logging.info(f"Updated file status to '{FileStatus.UPLOADED.value}' for file ID: {file_id}")
                 except Exception as mq_e:
-                    # If the message queue fails, log a warning but do not fail the upload.
-                    logging.warning(f"Failed to publish RabbitMQ message for file ID {file_id}: {mq_e}")
+                    # CRITICAL: Failed to publish to RabbitMQ. This is a hard failure.
+                    # We must roll back the MongoDB and Minio operations to ensure consistency.
+                    logging.critical(f"Failed to publish RabbitMQ message for file ID {file_id}: {mq_e}. Rolling back.")
+                    self._rollback_upload(object_name=object_name, file_id=file_id)
+
+                    # Inform the client that the service is temporarily unable to accept the file.
+                    # UNAVAILABLE is a good code for transient backend issues like the message broker being down.
+                    context.set_code(grpc.StatusCode.UNAVAILABLE)
+                    context.set_details("The service is temporarily unavailable to process the file. Please try again later.")
+                    return upload_pb2.UploadFileResponse()
             except Exception as e:
                 # CRITICAL: Failed to save metadata. Rollback the Minio upload.
-                logging.critical(f"Failed to save metadata for {object_name} after upload: {e}")
-                logging.info(f"Attempting to roll back by deleting object from Minio: {object_name}")
-                self.minio_client.delete_file(BucketType.RAW, object_name)
+                logging.critical(f"Failed to save metadata for {object_name} after upload: {e}", exc_info=True)
+                self._rollback_upload(object_name=object_name, file_id=file_id)
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details("Failed to save file metadata after upload. The operation was rolled back.")
                 return upload_pb2.UploadFileResponse()
