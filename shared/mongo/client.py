@@ -109,7 +109,7 @@ class MongoDbClient:
         - size (int): Size of the file in bytes.
         - object_name (str): The key of the file in the 'raw' Minio bucket.
         - status (str): Initial status, defaults to 'UNKNOWN'.
-        - created_at (datetime): Timestamp of creation.
+        - uploaded_at (datetime): Timestamp of when the file was uploaded.
 
         Args:
             sha256: The SHA256 hash of the file.
@@ -126,7 +126,7 @@ class MongoDbClient:
             "size": size,
             "object_name": object_name,
             "status": FileStatus.UNKNOWN.value,
-            "created_at": datetime.now(timezone.utc),
+            "uploaded_at": datetime.now(timezone.utc),
         }
         result = self._raw_files.insert_one(document)
         return str(result.inserted_id)
@@ -218,7 +218,7 @@ class MongoDbClient:
             "size": size,
             "object_name": object_name,
             "bucket_name": bucket_name,
-            "created_at": datetime.now(timezone.utc),
+            "uploaded_at": datetime.now(timezone.utc),
         }
         result = self._processed_files.insert_one(document)
         return str(result.inserted_id)
