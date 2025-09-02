@@ -111,61 +111,65 @@ class RabbitMQClient:
         """Publishes a message to the document processing queue."""
         self._publish_message(QueueType.DOCUMENT_QUEUE, asdict(message))
     
-    def start_consuming_uploads(self, callback_function: Callable[[UploadMessage, Callable[[], None]], None], auto_ack: bool = False):
+    def start_consuming_uploads(self, callback_function: Callable[[UploadMessage, Callable[[], None], Callable[[bool], None]], None], auto_ack: bool = False):
         """
         Starts consuming messages from the UPLOAD_QUEUE.
  
         This method wraps the raw pika callback to provide a cleaner interface.
-        It handles JSON parsing and provides a simple `ack_callback` function.
+        It handles JSON parsing and provides simple `ack_callback` and `nack_callback` functions.
 
         Args:
             callback_function: A function to be called for each message.
                 It must have the signature:
-                `callback(message: UploadMessage, ack_callback: Callable[[], None])`
+                `callback(message: UploadMessage, ack_callback: Callable[[], None], nack_callback: Callable[[bool], None])`
+                The `nack_callback` takes a boolean `requeue` parameter to indicate if the message should be retried.
             auto_ack: If True, messages are acknowledged automatically by the broker.
                 WARNING: Setting this to True is not recommended for this method,
-                as it bypasses the manual acknowledgment logic provided by `ack_callback`.
+                as it bypasses the manual acknowledgment logic provided by `ack_callback` and `nack_callback`.
                 The message will be considered handled upon delivery, risking data loss
-                if the consumer crashes. Calling the `ack_callback` will likely result
-                in a channel error.
+                if the consumer crashes. Calling the callbacks will likely result in a
+                channel error.
         """
         pika_callback = self._create_callback_wrapper(callback_function, UploadMessage)
         self._start_consuming(QueueType.UPLOAD_QUEUE, pika_callback, auto_ack=auto_ack)
 
-    def start_consuming_photos(self, callback_function: Callable[[PhotoMessage, Callable[[], None]], None], auto_ack: bool = False):
+    def start_consuming_photos(self, callback_function: Callable[[PhotoMessage, Callable[[], None], Callable[[bool], None]], None], auto_ack: bool = False):
         """
         Starts consuming messages from the PHOTO_QUEUE.
 
         Args:
             callback_function: A function to be called for each message.
                 It must have the signature:
-                `callback(message: PhotoMessage, ack_callback: Callable[[], None])`
+                `callback(message: PhotoMessage, ack_callback: Callable[[], None], nack_callback: Callable[[bool], None])`
+                The `nack_callback` takes a boolean `requeue` parameter to indicate if the message should be retried.
             auto_ack: If True, messages are acknowledged automatically.
         """
         pika_callback = self._create_callback_wrapper(callback_function, PhotoMessage)
         self._start_consuming(QueueType.PHOTO_QUEUE, pika_callback, auto_ack=auto_ack)
 
-    def start_consuming_videos(self, callback_function: Callable[[VideoMessage, Callable[[], None]], None], auto_ack: bool = False):
+    def start_consuming_videos(self, callback_function: Callable[[VideoMessage, Callable[[], None], Callable[[bool], None]], None], auto_ack: bool = False):
         """
         Starts consuming messages from the VIDEO_QUEUE.
 
         Args:
             callback_function: A function to be called for each message.
                 It must have the signature:
-                `callback(message: VideoMessage, ack_callback: Callable[[], None])`
+                `callback(message: VideoMessage, ack_callback: Callable[[], None], nack_callback: Callable[[bool], None])`
+                The `nack_callback` takes a boolean `requeue` parameter to indicate if the message should be retried.
             auto_ack: If True, messages are acknowledged automatically.
         """
         pika_callback = self._create_callback_wrapper(callback_function, VideoMessage)
         self._start_consuming(QueueType.VIDEO_QUEUE, pika_callback, auto_ack=auto_ack)
 
-    def start_consuming_documents(self, callback_function: Callable[[DocumentMessage, Callable[[], None]], None], auto_ack: bool = False):
+    def start_consuming_documents(self, callback_function: Callable[[DocumentMessage, Callable[[], None], Callable[[bool], None]], None], auto_ack: bool = False):
         """
         Starts consuming messages from the DOCUMENT_QUEUE.
 
         Args:
             callback_function: A function to be called for each message.
                 It must have the signature:
-                `callback(message: DocumentMessage, ack_callback: Callable[[], None])`
+                `callback(message: DocumentMessage, ack_callback: Callable[[], None], nack_callback: Callable[[bool], None])`
+                The `nack_callback` takes a boolean `requeue` parameter to indicate if the message should be retried.
             auto_ack: If True, messages are acknowledged automatically.
         """
         pika_callback = self._create_callback_wrapper(callback_function, DocumentMessage)
@@ -218,7 +222,8 @@ class RabbitMQClient:
         Generic factory to create a pika-compatible callback wrapper.
 
         This handles JSON deserialization, constructs the appropriate message
-        dataclass, and provides a simplified `ack_callback` to the user function.
+        dataclass, and provides simplified `ack_callback` and `nack_callback` functions
+        to the user function.
 
         Args:
             user_callback: The user's callback function.
@@ -228,6 +233,16 @@ class RabbitMQClient:
             A pika-compatible callback function.
         """
         def wrapper(ch, method, properties, body):
+            def nack_message(requeue: bool = False):
+                """Negatively acknowledges the message on the channel.
+
+                Args:
+                    requeue: If True, the message will be returned to the queue.
+                             If False, it will be discarded or dead-lettered.
+                """
+                if self.channel and self.channel.is_open:
+                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=requeue)
+
             try:
                 message_data = json.loads(body)
                 
@@ -236,7 +251,7 @@ class RabbitMQClient:
                 if not required_fields.issubset(message_data.keys()):
                     missing = required_fields - message_data.keys()
                     logging.warning(f"Malformed message for type {message_type.__name__}, missing fields {missing}: {body.decode()}. Discarding.")
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    nack_message(requeue=False)
                     return
 
                 def ack_message():
@@ -248,14 +263,13 @@ class RabbitMQClient:
                 message_instance = message_type(**{k: v for k, v in message_data.items() if k in required_fields})
                 
                 # Call the user's simplified callback
-                user_callback(message=message_instance, ack_callback=ack_message)
-
+                user_callback(message=message_instance, ack_callback=ack_message, nack_callback=nack_message)
             except (json.JSONDecodeError, TypeError) as e:
                 logging.error(f"Failed to decode or construct message for type {message_type.__name__}: {body.decode()}. Error: {e}. Discarding.", exc_info=True)
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                nack_message(requeue=False)
             except Exception as e:
                 logging.error(f"An unhandled error occurred in the callback wrapper for body {body.decode()}: {e}. Discarding message.", exc_info=True)
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                nack_message(requeue=False)
 
         return wrapper
 

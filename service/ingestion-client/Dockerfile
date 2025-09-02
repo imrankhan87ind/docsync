@@ -47,6 +47,7 @@ COPY service/ingestion-client/app.py .
 
 # Copy the dummy file for testing the upload
 COPY service/ingestion-client/test-data.mp4 .
+COPY service/ingestion-client/test-highres.jpg .
 
 # Make port 8000 available to the world outside this container
 EXPOSE 8000

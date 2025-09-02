@@ -136,7 +136,7 @@ class UploadProcessor:
                 file_data_stream.close()
                 file_data_stream.release_conn()
 
-    def _message_callback(self, message: UploadMessage, ack_callback: Callable[[], None], nack_callback: Callable[[bool], None]):
+    def _message_callback(self, message: UploadMessage, ack_callback: Callable[[], None]):
         """
         Callback function to process a message from the upload queue.
         Orchestrates the file processing workflow.

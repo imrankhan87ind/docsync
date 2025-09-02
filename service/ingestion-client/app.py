@@ -12,14 +12,15 @@ import upload_pb2, upload_pb2_grpc
 
 app = Flask(__name__)
 
-FILE_TO_UPLOAD="test-data.mp4"
+VIDEO_TO_UPLOAD="test-data.mp4"
+PHOTO_TO_UPLOAD="test-highres.jpg"
 CHUNK_SIZE = 8192
 UPLOAD_URL=os.environ.get("UPLOAD_SERVICE_URL", "localhost:5001")
 APP_PORT = int(os.environ.get("PORT", 8000))
 
 @app.route('/uploadtest')
 def uploadtest() -> str:
-    return upload_file(FILE_TO_UPLOAD)
+    return upload_file(PHOTO_TO_UPLOAD)
 
 def calculate_sha256(filepath: str) -> str:
     hasher = hashlib.sha256()

@@ -1,0 +1,9 @@
+minio
+pymongo
+pika
+Pillow
+piexif
+pydantic
+imagehash
+opencv-python-headless
+numpy

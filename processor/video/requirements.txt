@@ -1,0 +1,4 @@
+minio
+pymongo
+pika
+python-magic
