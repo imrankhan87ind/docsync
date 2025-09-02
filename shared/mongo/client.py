@@ -19,7 +19,6 @@ class FileStatus(Enum):
     """
     UNKNOWN = "UNKNOWN"          # Initial state before any processing
     UPLOADED = "UPLOADED"        # File successfully uploaded to Minio, metadata saved
-    PUBLISHED = "PUBLISHED"      # Processing message published to RabbitMQ
     PROCESSING = "PROCESSING"    # A worker has picked up the message and is processing the file
     COMPLETED = "COMPLETED"      # Processing finished successfully
     FAILED = "FAILED"            # Processing failed
