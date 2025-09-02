@@ -208,16 +208,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # webserver:
-  #   image: nginx:latest
-  #   ports:
-  #     - "8082:80"
-  #   restart: unless-stopped
-  # mydb:
-  #   image: postgress:latest
-  #   volumes:
-  #     - "db_data:/var/lib/postgresql/data:ro"
-
 volumes:
   minio-data:
     driver: local
