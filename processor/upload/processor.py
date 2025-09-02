@@ -6,7 +6,7 @@ import magic
 
 from shared.environment.config import app_config
 from shared.mongo.client import MongoDbClient, FileStatus, RawFileDetails
-from shared.rabbitmq.client import RabbitMQClient, UploadMessage
+from shared.rabbitmq.client import RabbitMQClient, UploadMessage, VideoMessage, PhotoMessage
 from shared.miniocdn.client import MinioClient, BucketType
 
 
@@ -70,77 +70,96 @@ class UploadProcessor:
             logging.error(f"An error occurred during MIME type extraction for file_id {file_id}: {e}", exc_info=True)
             return None
 
-    def _message_callback(self, message: UploadMessage, ack_callback: Callable[[], None]):
+    def _prepare_for_processing(self, file_id: str) -> str | None:
         """
-        Callback function to process a message from the upload queue.
-        This function is the core of the worker's logic.
+        Locks the file by setting its status to PROCESSING and retrieves its object_name.
 
         Args:
-            message: An `UploadMessage` object containing file details.
-            ack_callback: A function to call to acknowledge the message.
+            file_id: The ID of the file to prepare.
+
+        Returns:
+            The object_name if successful, otherwise None.
         """
-        file_id = message.file_id
+        logging.info(f"Updating status to PROCESSING for file_id: {file_id}")
+        if not self.mongo_client.update_raw_file_status(file_id, FileStatus.PROCESSING):
+            logging.warning(f"Could not find file_id {file_id} to update status. It may have been deleted.")
+            return None
+
+        file_metadata = self.mongo_client.get_raw_file_by_id(file_id)
+        if not file_metadata or not file_metadata.object_name:
+            logging.error(f"File document or object_name not found for file_id: {file_id}. Marking as FAILED.")
+            self.mongo_client.update_raw_file_status(file_id, FileStatus.FAILED)
+            return None
+
+        return file_metadata.object_name
+
+    def _route_by_mime_type(self, file_id: str, mime_type: str):
+        """
+        Routes a file to a specialized queue based on its MIME type or marks it as completed.
+        """
+        if mime_type.startswith('video/'):
+            logging.info(f"Routing file {file_id} ({mime_type}) to video processing queue.")
+            self.rabbitmq_client.publish_video_message(VideoMessage(raw_file_id=file_id))
+        elif mime_type.startswith('image/'):
+            logging.info(f"Routing file {file_id} ({mime_type}) to photo processing queue.")
+            self.rabbitmq_client.publish_photo_message(PhotoMessage(raw_file_id=file_id))
+        else:
+            # For other file types with no specialized processor, we mark processing as complete.
+            logging.info(f"No specific processor for MIME type {mime_type}. Marking file {file_id} as COMPLETED.")
+            self.mongo_client.update_raw_file_status(file_id, FileStatus.COMPLETED)
+
+    def _process_and_route_file(self, file_id: str, object_name: str):
+        """
+        Downloads the file, extracts MIME type, and routes it for further processing.
+        This method manages the file stream resource.
+        """
         file_data_stream = None
         try:
-            # 1. Update status to PROCESSING. This acts as a lock.
-            logging.info(f"Updating status to PROCESSING for file_id: {file_id}")
-            updated = self.mongo_client.update_raw_file_status(file_id, FileStatus.PROCESSING)
-            if not updated:
-                logging.warning(f"Could not find file_id {file_id} to update status. It may have been deleted. Acknowledging message.")
-                ack_callback()
-                return
-
-            # 2. Get file metadata from MongoDB to find the object_name
-            file_metadata = self.mongo_client.get_raw_file_by_id(file_id)
-            if not file_metadata or not file_metadata.object_name:
-                logging.error(f"File document or object_name not found for file_id: {file_id}. Marking as FAILED.")
-                self.mongo_client.update_raw_file_status(file_id, FileStatus.FAILED)
-                ack_callback()
-                return
-
-            object_name = file_metadata.object_name
             raw_bucket_name = BucketType.RAW.value
-
-            # 3. Download file from MinIO and extract details
             logging.info(f"Downloading '{object_name}' from bucket '{raw_bucket_name}' for file_id: {file_id}")
             file_data_stream = self.minio_client.get_file_stream(BucketType.RAW, object_name)
-            mime_type = self._extract_and_save_mime_type(file_id, file_data_stream)
 
+            mime_type = self._extract_and_save_mime_type(file_id, file_data_stream)
             if not mime_type:
                 logging.error(f"Failed to extract or save MIME type for file_id: {file_id}. Marking as FAILED.")
                 self.mongo_client.update_raw_file_status(file_id, FileStatus.FAILED)
-                ack_callback()
                 return
 
             # Note on original source info:
             # Original filesystem metadata like creation/modification dates are not part of the
             # file's content and are lost during a standard HTTP/gRPC upload.
             # The `uploaded_at` timestamp in our database serves as the authoritative creation time within our system.
+            self._route_by_mime_type(file_id, mime_type)
+            # If routed, the file status remains 'PROCESSING'. The next worker is responsible for the status update.
+        finally:
+            if file_data_stream:
+                file_data_stream.close()
+                file_data_stream.release_conn()
 
-            # 5. --- FURTHER PROCESSING LOGIC GOES HERE ---
-            # Based on the mime_type, you can now route to different processors
-            # (e.g., video, image, document processors).
-            logging.info(f"Simulating further processing for file_id: {file_id}...")
-            time.sleep(2)  # Simulate I/O or CPU-bound work
-            logging.info(f"Processing simulation complete for file_id: {file_id}.")
-            # --- END OF PROCESSING LOGIC ---
+    def _message_callback(self, message: UploadMessage, ack_callback: Callable[[], None]):
+        """
+        Callback function to process a message from the upload queue.
+        Orchestrates the file processing workflow.
+        """
+        file_id = message.file_id
+        try:
+            object_name = self._prepare_for_processing(file_id)
+            if not object_name:
+                # Failure is logged and status updated within the helper.
+                # We just need to stop and acknowledge the message via the finally block.
+                return
 
-            # 6. On success, update status to COMPLETED.
-            logging.info(f"Updating status to COMPLETED for file_id: {file_id}")
-            self.mongo_client.update_raw_file_status(file_id, FileStatus.COMPLETED)
+            self._process_and_route_file(file_id, object_name)
 
             logging.info(f"Successfully processed message for file_id: {file_id}")
 
         except Exception as e:
             logging.critical(f"An unhandled error occurred while processing message for file_id '{file_id}': {e}", exc_info=True)
             if file_id:
+                # This is a safety net for unexpected errors in the workflow.
                 self.mongo_client.update_raw_file_status(file_id, FileStatus.FAILED)
         finally:
-            # 7. Clean up the MinIO stream and acknowledge the message.
-            if file_data_stream:
-                file_data_stream.close()
-                file_data_stream.release_conn()
-            # This prevents requeue loops on both success and failure.
+            # Acknowledge the message to prevent requeue loops, regardless of outcome.
             ack_callback()
 
     def start_consuming(self):
