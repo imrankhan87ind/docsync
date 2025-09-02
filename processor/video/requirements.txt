@@ -1,4 +1,10 @@
 minio
 pymongo
 pika
-python-magic
+Pillow
+piexif
+pydantic
+imagehash
+opencv-python-headless
+numpy
+pymediainfo

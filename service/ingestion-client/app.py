@@ -18,8 +18,12 @@ CHUNK_SIZE = 8192
 UPLOAD_URL=os.environ.get("UPLOAD_SERVICE_URL", "localhost:5001")
 APP_PORT = int(os.environ.get("PORT", 8000))
 
-@app.route('/uploadtest')
-def uploadtest() -> str:
+@app.route('/uploadvideo')
+def uploadVideoTest() -> str:
+    return upload_file(VIDEO_TO_UPLOAD)
+
+@app.route('/uploadphoto')
+def uploadPhotoTest() -> str:
     return upload_file(PHOTO_TO_UPLOAD)
 
 def calculate_sha256(filepath: str) -> str:

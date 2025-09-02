@@ -3,10 +3,6 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies like libmagic
-RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 \
-    && rm -rf /var/lib/apt/lists/*
-
 # Create a non-root user for better security
 RUN useradd --create-home appuser
 

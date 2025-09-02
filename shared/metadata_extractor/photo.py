@@ -38,6 +38,12 @@ class GPSMetadata(BaseModel):
 
 class PhotoMetadata(BaseModel):
     """A model to hold structured EXIF metadata and perceptual hash from a photo."""
+    width: Optional[int] = Field(None, description="The width of the image in pixels.")
+    height: Optional[int] = Field(None, description="The height of the image in pixels.")
+    orientation: Optional[int] = Field(None, description="The EXIF orientation tag of the image (1-8). 1 is normal/horizontal.")
+    horizontal_resolution: Optional[float] = Field(None, description="Horizontal resolution, typically in dots per inch (DPI).")
+    vertical_resolution: Optional[float] = Field(None, description="Vertical resolution, typically in dots per inch (DPI).")
+    bit_depth: Optional[int] = Field(None, description="The number of bits per pixel, indicating color depth.")
     perceptual_hash: Optional[str] = Field(None, description="The perceptual hash of the image, for finding duplicates.")
     laplacian_variance: Optional[float] = Field(None, description="The variance of the Laplacian of the image, used to measure blur. Higher is sharper.")
     gps: Optional[GPSMetadata] = None
@@ -132,6 +138,14 @@ class PhotoMetadataExtractor:
         """
         try:
             img = Image.open(image_stream)
+            width, height = img.size
+
+            # Determine bit depth from image mode
+            mode_to_bpp = {
+                '1': 1, 'L': 8, 'P': 8, 'RGB': 24, 'RGBA': 32,
+                'CMYK': 32, 'YCbCr': 24, 'I': 32, 'F': 32,
+            }
+            bit_depth = mode_to_bpp.get(img.mode)
 
             # Calculate perceptual hash
             try:
@@ -162,12 +176,37 @@ class PhotoMetadataExtractor:
 
             if not exif_data:
                 logging.info("No EXIF data found in the image.")
-                return PhotoMetadata(perceptual_hash=p_hash, laplacian_variance=laplacian_var)
+                return PhotoMetadata(
+                    width=width,
+                    height=height,
+                    bit_depth=bit_depth,
+                    perceptual_hash=p_hash,
+                    laplacian_variance=laplacian_var,
+                    # Explicitly set EXIF-related fields to None to satisfy linters
+                    # when no EXIF data is present.
+                    orientation=None,  # No EXIF means no orientation tag.
+                    horizontal_resolution=None,
+                    vertical_resolution=None,
+                    gps=None,
+                    date_time_original=None,
+                    camera_make=None,
+                    camera_model=None,
+                    f_number=None,
+                    exposure_time=None,
+                    iso_speed=None,
+                )
 
             exif_dict = piexif.load(exif_data)
             zeroth_ifd = exif_dict.get("0th", {})
             exif_ifd = exif_dict.get("Exif", {})
             gps_ifd = exif_dict.get("GPS", {})
+
+            # Parse Orientation. It's in the 0th IFD.
+            orientation = zeroth_ifd.get(piexif.ImageIFD.Orientation)
+
+            # Parse Resolution. It's in the 0th IFD.
+            horizontal_resolution = self._rational_to_float(zeroth_ifd.get(piexif.ImageIFD.XResolution))
+            vertical_resolution = self._rational_to_float(zeroth_ifd.get(piexif.ImageIFD.YResolution))
 
             # Parse GPS
             gps_metadata = self._parse_gps_info(gps_ifd)
@@ -187,6 +226,12 @@ class PhotoMetadataExtractor:
             iso_speed = exif_ifd.get(piexif.ExifIFD.ISOSpeedRatings)
 
             return PhotoMetadata(
+                width=width,
+                height=height,
+                bit_depth=bit_depth,
+                horizontal_resolution=horizontal_resolution,
+                vertical_resolution=vertical_resolution,
+                orientation=orientation,
                 perceptual_hash=p_hash,
                 laplacian_variance=laplacian_var,
                 gps=gps_metadata,
@@ -199,5 +244,22 @@ class PhotoMetadataExtractor:
             )
         except Exception as e:
             logging.error(f"An unexpected error occurred during metadata extraction: {e}", exc_info=True)
-            # In case of a catastrophic failure, return an empty object.
-            return PhotoMetadata()
+            # In case of a catastrophic failure, return an empty object with all fields as None.
+            # This explicit initialization satisfies linters like Pylance.
+            return PhotoMetadata(
+                width=None,
+                height=None,
+                bit_depth=None,
+                horizontal_resolution=None,
+                vertical_resolution=None,
+                orientation=None,
+                perceptual_hash=None,
+                laplacian_variance=None,
+                gps=None,
+                date_time_original=None,
+                camera_make=None,
+                camera_model=None,
+                f_number=None,
+                exposure_time=None,
+                iso_speed=None,
+            )
